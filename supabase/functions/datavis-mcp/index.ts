@@ -26,8 +26,9 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 // ---------------------------------------------------------------------------
 
 const GSHEET_WEBHOOK_URL =
+  Deno.env.get("GSHEET_WEBHOOK_URL") ??
   "https://finderai.app.n8n.cloud/webhook/datavis-gsheet";
-const GSHEET_API_KEY = "of-datavis-gsheet-2026";
+const GSHEET_API_KEY = Deno.env.get("GSHEET_API_KEY") ?? "";
 
 const WORKSPACES = [
   { id: "global", code: "GX", name: "Global" },
@@ -100,7 +101,10 @@ server.registerTool(
       .eq("workspace_id", workspace_id)
       .order("created_at", { ascending: false });
 
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("list_folders error:", error);
+      throw new Error("Failed to list folders");
+    }
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     };
@@ -121,13 +125,17 @@ server.registerTool(
         .describe("Workspace / market ID"),
       folder_id: z
         .string()
+        .uuid()
         .optional()
         .describe("Filter to a specific folder (UUID)"),
       limit: z
         .number()
+        .int()
+        .min(1)
+        .max(200)
         .optional()
         .default(50)
-        .describe("Max charts to return (default 50)"),
+        .describe("Max charts to return (default 50, max 200)"),
     },
     annotations: { readOnlyHint: true },
   },
@@ -135,7 +143,7 @@ server.registerTool(
     let query = supabase
       .from("data_visualizer_charts")
       .select(
-        "id, name, chart_type, workspace_id, folder_id, is_public, share_token, created_by, created_at, updated_at",
+        "id, name, chart_type, workspace_id, folder_id, is_public, created_by, created_at, updated_at",
       )
       .eq("workspace_id", workspace_id)
       .order("created_at", { ascending: false })
@@ -146,7 +154,10 @@ server.registerTool(
     }
 
     const { data, error } = await query;
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("list_charts error:", error);
+      throw new Error("Failed to list charts");
+    }
 
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
@@ -163,7 +174,7 @@ server.registerTool(
     description:
       "Get a single chart by ID, including full data payload and config.",
     inputSchema: {
-      chart_id: z.string().describe("Chart UUID"),
+      chart_id: z.string().uuid().describe("Chart UUID"),
     },
     annotations: { readOnlyHint: true },
   },
@@ -174,7 +185,10 @@ server.registerTool(
       .eq("id", chart_id)
       .single();
 
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("get_chart error:", error);
+      throw new Error("Failed to fetch chart");
+    }
     if (!data) throw new Error("Chart not found");
 
     return {
@@ -298,7 +312,7 @@ chart_config controls display options (title, legend, axes, source attribution).
       workspace_id: z
         .enum(["global", "us", "uk", "ca", "au"])
         .describe("Target workspace / market"),
-      folder_id: z.string().describe("Target folder UUID"),
+      folder_id: z.string().uuid().describe("Target folder UUID"),
       chart_data: z
         .record(z.string(), z.any())
         .describe(
@@ -352,7 +366,10 @@ chart_config controls display options (title, legend, axes, source attribution).
       .select("id, name, chart_type, share_token, is_public, created_at")
       .single();
 
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("create_chart error:", error);
+      throw new Error("Failed to create chart");
+    }
 
     return {
       content: [
@@ -381,7 +398,7 @@ server.registerTool(
     description:
       "Update an existing chart. Only include fields you want to change.",
     inputSchema: {
-      chart_id: z.string().describe("Chart UUID to update"),
+      chart_id: z.string().uuid().describe("Chart UUID to update"),
       name: z.string().optional().describe("New chart name"),
       chart_type: z.enum(CHART_TYPES).optional().describe("New chart type"),
       chart_data: z
@@ -411,7 +428,10 @@ server.registerTool(
       .select("id, name, chart_type, updated_at")
       .single();
 
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("update_chart error:", error);
+      throw new Error("Failed to update chart");
+    }
 
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
@@ -428,7 +448,7 @@ server.registerTool(
     description:
       "Make a chart public (embeddable) or private. Public charts get a share_token for WordPress embedding.",
     inputSchema: {
-      chart_id: z.string().describe("Chart UUID"),
+      chart_id: z.string().uuid().describe("Chart UUID"),
       is_public: z.boolean().describe("true = public, false = private"),
     },
   },
@@ -440,7 +460,10 @@ server.registerTool(
       .select("id, name, is_public, share_token")
       .single();
 
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("set_chart_visibility error:", error);
+      throw new Error("Failed to update chart visibility");
+    }
 
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
@@ -457,7 +480,7 @@ server.registerTool(
     description:
       "Get the WordPress shortcode and embed URL for a public chart. Returns both the partial shortcode (for WordPress) and a raw iframe snippet.",
     inputSchema: {
-      chart_id: z.string().describe("Chart UUID"),
+      chart_id: z.string().uuid().describe("Chart UUID"),
       target_market: z
         .enum(["us", "au", "uk", "ca"])
         .optional()
@@ -475,7 +498,10 @@ server.registerTool(
       .eq("id", chart_id)
       .single();
 
-    if (error) throw new Error(`Supabase error: ${error.message}`);
+    if (error) {
+      console.error("get_embed_code error:", error);
+      throw new Error("Failed to fetch chart");
+    }
     if (!data) throw new Error("Chart not found");
     if (!data.is_public)
       throw new Error("Chart is not public. Use set_chart_visibility first.");
@@ -488,7 +514,12 @@ server.registerTool(
       : `[partial id="datavis" chart="${data.share_token}"]`;
 
     const embedUrl = `${EMBED_BASE_URL}/embed/${data.share_token}`;
-    const iframe = `<iframe src="${embedUrl}" width="100%" height="450" frameborder="0" style="border:0;border-radius:8px" loading="lazy" title="${data.name}"></iframe>`;
+    const safeName = data.name
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    const iframe = `<iframe src="${embedUrl}" width="100%" height="450" frameborder="0" style="border:0;border-radius:8px" loading="lazy" title="${safeName}"></iframe>`;
 
     return {
       content: [
@@ -516,7 +547,7 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": "https://www.only-finders.com",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
     "Content-Type, x-api-key, mcp-session-id, Last-Event-ID, mcp-protocol-version",
@@ -548,7 +579,15 @@ Deno.serve(async (req: Request) => {
       .map((k) => k.trim())
       .filter(Boolean);
 
-    if (validKeys.length > 0 && (!apiKey || !validKeys.includes(apiKey))) {
+    if (validKeys.length === 0) {
+      console.error("MCP_API_KEYS is not configured — rejecting all requests");
+      return new Response(JSON.stringify({ error: "Server misconfigured" }), {
+        status: 500,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (!apiKey || !validKeys.includes(apiKey)) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -573,7 +612,7 @@ Deno.serve(async (req: Request) => {
       });
     } catch (err) {
       console.error("MCP handler error:", err);
-      return new Response(JSON.stringify({ error: (err as Error).message }), {
+      return new Response(JSON.stringify({ error: "Internal server error" }), {
         status: 500,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
       });
