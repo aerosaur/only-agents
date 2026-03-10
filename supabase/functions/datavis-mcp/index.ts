@@ -1,11 +1,21 @@
 /**
- * OnlyFinders Data Visualizer MCP Server
+ * OnlyFinders MCP Server (Only Agents)
  *
- * Supabase Edge Function exposing Data Visualizer operations as MCP tools.
+ * Supabase Edge Function exposing OnlyFinders tools as MCP operations.
  * Uses Streamable HTTP transport — clients connect via URL, not stdio.
  *
+ * Tool domains:
+ *   - Data Visualizer: chart CRUD, Google Sheets import, embedding
+ *   - Product Watchtower: provider/product search, watchlist management
+ *
  * Endpoint: POST /datavis-mcp/mcp
- * Auth: x-api-key header checked against MCP_API_KEY secret
+ * Auth: x-api-key header checked against MCP_API_KEYS secret
+ *
+ * Required secrets:
+ *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY — Supabase access
+ *   MCP_API_KEYS — comma-separated API keys for MCP auth
+ *   GSHEET_WEBHOOK_URL, GSHEET_API_KEY — Google Sheets import (Data Viz)
+ *   PRODUCT_API_USERNAME, PRODUCT_API_KEY — Finder Product API (Watchtower)
  */
 
 import { McpServer } from "npm:@modelcontextprotocol/sdk@1.27.1/server/mcp.js";
@@ -55,12 +65,235 @@ const CHART_TYPES = [
 const EMBED_BASE_URL = "https://www.only-finders.com";
 
 // ---------------------------------------------------------------------------
+// Product API (PAPI) — used by Watchtower tools
+// ---------------------------------------------------------------------------
+
+const PAPI_BASE = "https://product.api.production-02.fndr.systems/api/v117";
+const PAPI_USERNAME = Deno.env.get("PRODUCT_API_USERNAME") ?? "";
+const PAPI_KEY = Deno.env.get("PRODUCT_API_KEY") ?? "";
+
+async function fetchPAPI(path: string): Promise<unknown> {
+  if (!PAPI_USERNAME || !PAPI_KEY) {
+    throw new Error("Product API credentials not configured");
+  }
+  const res = await fetch(`${PAPI_BASE}${path}`, {
+    headers: {
+      "X-Auth-Username": PAPI_USERNAME,
+      "X-API-Key": PAPI_KEY,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`PAPI ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+/**
+ * Fetch all providers for a niche from PAPI. Paginates server-side.
+ * Returns array of { id, name }.
+ */
+async function fetchNicheProviders(
+  nicheCode: string,
+): Promise<Array<{ id: string; name: string }>> {
+  const providers: Array<{ id: string; name: string }> = [];
+
+  const first = (await fetchPAPI(
+    `/niches/${nicheCode}/data/providers?format=minimal&offset=0`,
+  )) as { count?: number; items?: unknown[] };
+  const totalCount = first.count || 0;
+
+  for (const p of first.items || []) {
+    const v =
+      (p as { calculated?: { values?: Record<string, unknown> } }).calculated
+        ?.values || {};
+    const id = v["GENERAL.ID"] as string;
+    const name = v["GENERAL.NAME"] as string;
+    if (id && name) providers.push({ id, name });
+  }
+
+  if (totalCount > 20) {
+    const offsets: number[] = [];
+    for (let o = 20; o < totalCount; o += 20) offsets.push(o);
+
+    // Fetch in parallel batches of 5
+    for (let i = 0; i < offsets.length; i += 5) {
+      const batch = offsets.slice(i, i + 5);
+      const results = await Promise.all(
+        batch.map((o) =>
+          fetchPAPI(
+            `/niches/${nicheCode}/data/providers?format=minimal&offset=${o}`,
+          ),
+        ),
+      );
+      for (const data of results) {
+        for (const p of (data as { items?: unknown[] }).items || []) {
+          const v =
+            (p as { calculated?: { values?: Record<string, unknown> } })
+              .calculated?.values || {};
+          const id = v["GENERAL.ID"] as string;
+          const name = v["GENERAL.NAME"] as string;
+          if (id && name) providers.push({ id, name });
+        }
+      }
+    }
+  }
+
+  providers.sort((a, b) => a.name.localeCompare(b.name));
+  return providers;
+}
+
+/**
+ * Fetch products for a niche, optionally filtered by provider.
+ * Uses PAPI's RSQL filter when provider is specified.
+ */
+async function fetchNicheProducts(
+  nicheCode: string,
+  providerId?: string,
+): Promise<
+  Array<{
+    id: string;
+    name: string;
+    providerId: string | null;
+    active: unknown;
+  }>
+> {
+  const products: Array<{
+    id: string;
+    name: string;
+    providerId: string | null;
+    active: unknown;
+  }> = [];
+  const filterParam = providerId
+    ? `&filter=${encodeURIComponent(`GENERAL.PROVIDER_ID=="${providerId}"`)}`
+    : "";
+
+  const first = (await fetchPAPI(
+    `/niches/${nicheCode}/data/products?format=minimal&offset=0${filterParam}`,
+  )) as { count?: number; items?: unknown[] };
+  const totalCount = first.count || 0;
+
+  const extract = (p: unknown) => {
+    const v =
+      (p as { calculated?: { values?: Record<string, unknown> } }).calculated
+        ?.values || {};
+    return {
+      id: v["GENERAL.ID"] as string,
+      name: v["GENERAL.NAME"] as string,
+      providerId: (v["GENERAL.PROVIDER_ID"] as string) || null,
+      active: v["GENERAL.ACTIVE"],
+    };
+  };
+
+  for (const p of first.items || []) products.push(extract(p));
+
+  if (totalCount > 20) {
+    const offsets: number[] = [];
+    for (let o = 20; o < totalCount; o += 20) offsets.push(o);
+
+    for (let i = 0; i < offsets.length; i += 10) {
+      const batch = offsets.slice(i, i + 10);
+      const results = await Promise.all(
+        batch.map((o) =>
+          fetchPAPI(
+            `/niches/${nicheCode}/data/products?format=minimal&offset=${o}${filterParam}`,
+          ),
+        ),
+      );
+      for (const data of results) {
+        for (const p of (data as { items?: unknown[] }).items || []) {
+          products.push(extract(p));
+        }
+      }
+    }
+  }
+
+  products.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  return products;
+}
+
+/**
+ * Fuzzy match a query against a name. Returns a score (0 = no match).
+ * All query tokens must appear in the name for a match.
+ */
+function fuzzyScore(name: string, query: string): number {
+  const nameLower = name.toLowerCase();
+  const queryLower = query.toLowerCase();
+  const queryTokens = queryLower.split(/\s+/).filter(Boolean);
+
+  if (queryTokens.length === 0) return 0;
+  if (!queryTokens.every((t) => nameLower.includes(t))) return 0;
+
+  // Exact match
+  if (nameLower === queryLower) return 100;
+
+  let score = 50;
+  // Name starts with query → strong signal
+  if (nameLower.startsWith(queryLower)) score += 30;
+  // Shorter names that match are more specific
+  score += Math.max(0, 20 - (nameLower.length - queryLower.length));
+
+  return score;
+}
+
+/**
+ * Calculate the next scheduled run time.
+ */
+function calcNextRun(frequency: string): string | null {
+  const next = new Date();
+  switch (frequency) {
+    case "daily":
+      next.setUTCDate(next.getUTCDate() + 1);
+      next.setUTCHours(6, 0, 0, 0);
+      return next.toISOString();
+    case "twice_weekly": {
+      const day = next.getUTCDay();
+      const daysToMon = (1 - day + 7) % 7 || 7;
+      const daysToThu = (4 - day + 7) % 7 || 7;
+      next.setUTCDate(next.getUTCDate() + Math.min(daysToMon, daysToThu));
+      next.setUTCHours(6, 0, 0, 0);
+      return next.toISOString();
+    }
+    case "weekly": {
+      const dayW = next.getUTCDay();
+      next.setUTCDate(next.getUTCDate() + ((1 - dayW + 7) % 7 || 7));
+      next.setUTCHours(6, 0, 0, 0);
+      return next.toISOString();
+    }
+    case "twice_monthly":
+      if (next.getUTCDate() < 15) {
+        next.setUTCDate(15);
+      } else {
+        next.setUTCMonth(next.getUTCMonth() + 1, 1);
+      }
+      next.setUTCHours(6, 0, 0, 0);
+      return next.toISOString();
+    case "monthly":
+      next.setUTCMonth(next.getUTCMonth() + 1, 1);
+      next.setUTCHours(6, 0, 0, 0);
+      return next.toISOString();
+    default:
+      return null; // manual
+  }
+}
+
+const SCHEDULE_FREQUENCIES = [
+  "daily",
+  "twice_weekly",
+  "weekly",
+  "twice_monthly",
+  "monthly",
+  "manual",
+] as const;
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
 const server = new McpServer({
-  name: "onlyfinders-datavis",
-  version: "1.0.0",
+  name: "onlyfinders",
+  version: "2.0.0",
 });
 
 // ---- list_workspaces -------------------------------------------------------
@@ -542,6 +775,417 @@ server.registerTool(
   },
 );
 
+// ===========================================================================
+// PRODUCT WATCHTOWER TOOLS
+// ===========================================================================
+
+// ---- list_niches (watchtower) -----------------------------------------------
+
+server.registerTool(
+  "list_niches",
+  {
+    title: "List Configured Niches",
+    description:
+      "List product niches that have been configured for Watchtower monitoring in a given country. Only configured niches (with field schemas ready) can have watchlist items added.",
+    inputSchema: {
+      country_code: z
+        .string()
+        .describe("Lowercase country code (e.g. 'us', 'au', 'uk', 'ca')"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ country_code }) => {
+    const { data, error } = await supabase
+      .from("pw_niche_configs")
+      .select("niche_code, country_code, status, created_at, updated_at")
+      .eq("country_code", country_code.toLowerCase())
+      .eq("status", "ready")
+      .order("niche_code");
+
+    if (error) {
+      console.error("list_niches error:", error);
+      throw new Error("Failed to list niche configs");
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { country_code: country_code.toLowerCase(), niches: data },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ---- search_providers (watchtower) ------------------------------------------
+
+server.registerTool(
+  "search_providers",
+  {
+    title: "Search Providers",
+    description:
+      "Fuzzy search for providers across all configured Watchtower niches in a country. Use this to find a provider when you know their name but not which niche they belong to. Returns matching providers grouped by niche, sorted by match quality.",
+    inputSchema: {
+      query: z
+        .string()
+        .describe("Provider name to search for (e.g. 'Chase Bank', 'Amex')"),
+      country_code: z
+        .string()
+        .describe("Lowercase country code (e.g. 'us', 'au')"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ query, country_code }) => {
+    // Get configured niches for this country
+    const { data: configs, error: configErr } = await supabase
+      .from("pw_niche_configs")
+      .select("niche_code")
+      .eq("country_code", country_code.toLowerCase())
+      .eq("status", "ready");
+
+    if (configErr) {
+      console.error("search_providers config error:", configErr);
+      throw new Error("Failed to fetch niche configs");
+    }
+
+    if (!configs || configs.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                query,
+                country_code: country_code.toLowerCase(),
+                matches: [],
+                message: "No configured niches found for this country.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Search providers in each configured niche in parallel
+    const results = await Promise.allSettled(
+      configs.map(async (c) => {
+        const providers = await fetchNicheProviders(c.niche_code);
+        return { niche_code: c.niche_code, providers };
+      }),
+    );
+
+    // Score and collect matches
+    const matches: Array<{
+      niche_code: string;
+      provider_id: string;
+      provider_name: string;
+      score: number;
+    }> = [];
+
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      const { niche_code, providers } = result.value;
+
+      for (const provider of providers) {
+        const score = fuzzyScore(provider.name, query);
+        if (score > 0) {
+          matches.push({
+            niche_code,
+            provider_id: provider.id,
+            provider_name: provider.name,
+            score,
+          });
+        }
+      }
+    }
+
+    // Sort by score descending, then by name
+    matches.sort(
+      (a, b) =>
+        b.score - a.score || a.provider_name.localeCompare(b.provider_name),
+    );
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              query,
+              country_code: country_code.toLowerCase(),
+              niches_searched: configs.length,
+              matches,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ---- list_niche_providers (watchtower) --------------------------------------
+
+server.registerTool(
+  "list_niche_providers",
+  {
+    title: "List Niche Providers",
+    description:
+      "List all providers in a specific product niche from the Product API. Use after search_providers to see all providers in a niche, or to browse providers before adding to a watchlist.",
+    inputSchema: {
+      niche_code: z.string().describe("Niche code (e.g. 'USCCF', 'AUFHI-NEW')"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ niche_code }) => {
+    const providers = await fetchNicheProviders(niche_code);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { niche_code, count: providers.length, providers },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ---- list_provider_products (watchtower) ------------------------------------
+
+server.registerTool(
+  "list_provider_products",
+  {
+    title: "List Provider Products",
+    description:
+      "List products from a specific provider in a niche. Use after selecting a provider to see which individual products can be added to the watchlist.",
+    inputSchema: {
+      niche_code: z.string().describe("Niche code (e.g. 'USCCF')"),
+      provider_id: z.string().describe("Provider ID from PAPI"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ niche_code, provider_id }) => {
+    const products = await fetchNicheProducts(niche_code, provider_id);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              niche_code,
+              provider_id,
+              count: products.length,
+              products,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ---- add_watchlist_items (watchtower) ----------------------------------------
+
+server.registerTool(
+  "add_watchlist_items",
+  {
+    title: "Add Watchlist Items",
+    description: `Add providers and/or products to the Product Watchtower watchlist. Items inherit their field configuration from the niche config automatically.
+
+Each item needs: entity_type (provider or product), entity_id, entity_name, niche_code. Products should also include provider_id and provider_name.
+
+The schedule_frequency applies to all items in the batch. Items are upserted — duplicates (same entity_type + entity_id + niche_code) are skipped.`,
+    inputSchema: {
+      country_code: z
+        .string()
+        .describe("Lowercase country code (e.g. 'us', 'au')"),
+      niche_code: z.string().describe("Niche code (e.g. 'USCCF')"),
+      schedule_frequency: z
+        .enum(SCHEDULE_FREQUENCIES)
+        .describe(
+          "How often to check: daily, twice_weekly, weekly, twice_monthly, monthly, manual",
+        ),
+      items: z
+        .array(
+          z.object({
+            entity_type: z
+              .enum(["provider", "product"])
+              .describe("'provider' or 'product'"),
+            entity_id: z.string().describe("Entity ID from PAPI"),
+            entity_name: z.string().describe("Entity display name"),
+            provider_id: z
+              .string()
+              .optional()
+              .describe("Provider ID (required for products)"),
+            provider_name: z
+              .string()
+              .optional()
+              .describe("Provider name (required for products)"),
+          }),
+        )
+        .describe("Array of items to add to the watchlist"),
+    },
+  },
+  async ({ country_code, niche_code, schedule_frequency, items }) => {
+    const cc = country_code.toLowerCase();
+
+    // Fetch niche config for field schema inheritance
+    const { data: config, error: configErr } = await supabase
+      .from("pw_niche_configs")
+      .select("*")
+      .eq("niche_code", niche_code)
+      .eq("country_code", cc)
+      .eq("status", "ready")
+      .single();
+
+    if (configErr || !config) {
+      throw new Error(
+        `Niche '${niche_code}' is not configured for country '${cc}'. Use list_niches to see available niches.`,
+      );
+    }
+
+    const nextRun = calcNextRun(schedule_frequency);
+
+    const rows = items.map((item) => {
+      const isProduct = item.entity_type === "product";
+      const fieldSchema = isProduct
+        ? config.product_field_schema
+        : config.provider_field_schema;
+      const hasFields = fieldSchema && fieldSchema.length > 0;
+
+      return {
+        entity_type: item.entity_type,
+        entity_id: item.entity_id,
+        entity_name: item.entity_name,
+        niche_code,
+        country_code: cc,
+        provider_id: item.provider_id || null,
+        provider_name: item.provider_name || null,
+        schedule_frequency,
+        schedule_next_run_at: nextRun,
+        status: hasFields ? "active" : "pending_fields",
+        ...(hasFields && {
+          field_config: fieldSchema,
+          field_config_version: 1,
+        }),
+      };
+    });
+
+    const { data, error } = await supabase
+      .from("pw_watchlist_items")
+      .upsert(rows, {
+        onConflict: "entity_type,entity_id,niche_code",
+        ignoreDuplicates: true,
+      })
+      .select();
+
+    if (error) {
+      console.error("add_watchlist_items error:", error);
+      throw new Error("Failed to add watchlist items");
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              added: data?.length ?? 0,
+              schedule_frequency,
+              next_run: nextRun,
+              items: data,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ---- list_watchlist (watchtower) --------------------------------------------
+
+server.registerTool(
+  "list_watchlist",
+  {
+    title: "List Watchlist",
+    description:
+      "List current Product Watchtower items for a country, optionally filtered by niche. Shows what's being monitored and their schedule/status.",
+    inputSchema: {
+      country_code: z
+        .string()
+        .describe("Lowercase country code (e.g. 'us', 'au')"),
+      niche_code: z
+        .string()
+        .optional()
+        .describe("Filter to a specific niche code"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .default(50)
+        .describe("Max items to return (default 50, max 200)"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ country_code, niche_code, limit }) => {
+    let query = supabase
+      .from("pw_watchlist_items")
+      .select(
+        "id, entity_type, entity_id, entity_name, niche_code, country_code, provider_id, provider_name, schedule_frequency, schedule_next_run_at, status, created_at",
+      )
+      .eq("country_code", country_code.toLowerCase())
+      .order("created_at", { ascending: false })
+      .limit(limit ?? 50);
+
+    if (niche_code) {
+      query = query.eq("niche_code", niche_code);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("list_watchlist error:", error);
+      throw new Error("Failed to list watchlist items");
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              country_code: country_code.toLowerCase(),
+              ...(niche_code && { niche_code }),
+              count: data?.length ?? 0,
+              items: data,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
 // ---------------------------------------------------------------------------
 // HTTP handler — Streamable HTTP transport with API key auth
 // ---------------------------------------------------------------------------
@@ -565,7 +1209,7 @@ Deno.serve(async (req: Request) => {
 
   // Health check
   if (path === "/health" || path === "/health/") {
-    return new Response(JSON.stringify({ status: "ok", tools: 10 }), {
+    return new Response(JSON.stringify({ status: "ok", tools: 16 }), {
       headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
     });
   }
