@@ -1,6 +1,6 @@
 # Only Agents
 
-MCP server for [OnlyFinders](https://www.only-finders.com) — exposes the Data Visualizer as tools any MCP-compatible client can use.
+MCP server for [OnlyFinders](https://www.finderops.ai) — exposes the Data Visualizer as tools any MCP-compatible client can use.
 
 Built as a [Supabase Edge Function](https://supabase.com/docs/guides/functions) using [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http).
 
